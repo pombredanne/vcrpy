@@ -7,7 +7,7 @@ class Request(object):
         self.method = method
         self.path = path
         self.body = body
-        # make haders a frozenset so it will be hashable
+        # make headers a frozenset so it will be hashable
         self.headers = frozenset(headers.items())
 
     @property
@@ -15,7 +15,14 @@ class Request(object):
         return "{0}://{1}{2}".format(self.protocol, self.host, self.path)
 
     def __key(self):
-        return (self.host, self.port, self.method, self.path, self.body, self.headers)
+        return (
+            self.host,
+            self.port,
+            self.method,
+            self.path,
+            self.body,
+            self.headers
+        )
 
     def __hash__(self):
         return hash(self.__key())
@@ -28,3 +35,18 @@ class Request(object):
 
     def __repr__(self):
         return self.__str__()
+
+    def _to_dict(self):
+        return {
+            'protocol': self.protocol,
+            'host': self.host,
+            'port': self.port,
+            'method': self.method,
+            'path': self.path,
+            'body': self.body,
+            'headers': self.headers,
+        }
+
+    @classmethod
+    def _from_dict(cls, dct):
+        return Request(**dct)
