@@ -8,18 +8,8 @@ except ImportError:
 
 
 def deserialize(cassette_string):
-    data = yaml.load(cassette_string, Loader=Loader)
-    requests = [r['request'] for r in data]
-    responses = [r['response'] for r in data]
-    return requests, responses
+    return yaml.load(cassette_string, Loader=Loader)
 
 
 def serialize(cassette_dict):
-    data = ([{
-        'request': request,
-        'response': response,
-    } for request, response in zip(
-        cassette_dict['requests'],
-        cassette_dict['responses']
-    )])
-    return yaml.dump(data, Dumper=Dumper)
+    return yaml.dump(cassette_dict, Dumper=Dumper)

@@ -1,6 +1,6 @@
 import pytest
-from urllib2 import urlopen
 import vcr
+from six.moves.urllib.request import urlopen
 
 
 def test_making_extra_request_raises_exception(tmpdir):

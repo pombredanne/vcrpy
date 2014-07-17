@@ -3,7 +3,10 @@ requests = pytest.importorskip("requests")
 
 import vcr
 
-import httplib
+try:
+    import httplib
+except ImportError:
+    import http.client as httplib
 
 
 def test_domain_redirect():
@@ -37,11 +40,11 @@ def test_flickr_multipart_upload():
         data = r.read()
         h.close()
 
-    with vcr.use_cassette('fixtures/vcr_cassettes/flickr.json') as cass:
+    with vcr.use_cassette('fixtures/vcr_cassettes/flickr.yaml') as cass:
         _pretend_to_be_flickr_library()
         assert len(cass) == 1
 
-    with vcr.use_cassette('fixtures/vcr_cassettes/flickr.json') as cass:
+    with vcr.use_cassette('fixtures/vcr_cassettes/flickr.yaml') as cass:
         assert len(cass) == 1
         _pretend_to_be_flickr_library()
         assert cass.play_count == 1
@@ -53,12 +56,6 @@ def test_flickr_should_respond_with_200(tmpdir):
         r = requests.post("http://api.flickr.com/services/upload")
         assert r.status_code == 200
 
-def x_test_zip_file(tmpdir):
-    # TODO: How do I make this pass?
-    zipfile = "http://www.colorado.edu/conflict/peace/download/peace_example.ZIP"
-    testfile = str(tmpdir.join('test.json'))
-    with vcr.use_cassette(testfile, serializer='json'):
-        r = requests.post(zipfile)
 
 def test_cookies(tmpdir):
     testfile = str(tmpdir.join('cookies.yml'))
@@ -67,5 +64,3 @@ def test_cookies(tmpdir):
         r1 = s.get("http://httpbin.org/cookies/set?k1=v1&k2=v2")
         r2 = s.get("http://httpbin.org/cookies")
         assert len(r2.json()['cookies']) == 2
-
-

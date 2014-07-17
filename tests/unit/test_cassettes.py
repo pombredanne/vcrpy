@@ -7,9 +7,10 @@ from vcr.errors import UnhandledHTTPRequestError
 
 def test_cassette_load(tmpdir):
     a_file = tmpdir.join('test_cassette.yml')
-    a_file.write(yaml.dump([
-        {'request': 'foo', 'response': 'bar'}
-    ]))
+    a_file.write(yaml.dump({'interactions': [
+        {'request': {'body': '', 'uri': 'foo', 'method': 'GET', 'headers': {}},
+         'response': 'bar'}
+    ]}))
     a_cassette = Cassette.load(str(a_file))
     assert len(a_cassette) == 1
 
@@ -57,10 +58,25 @@ def test_cassette_get_missing_response():
     with pytest.raises(UnhandledHTTPRequestError):
         a.responses_of('foo')
 
+
 @mock.patch('vcr.cassette.requests_match', _mock_requests_match)
 def test_cassette_cant_read_same_request_twice():
     a = Cassette('test')
-    a.append('foo','bar')
+    a.append('foo', 'bar')
     a.play_response('foo')
     with pytest.raises(UnhandledHTTPRequestError):
         a.play_response('foo')
+
+
+def test_cassette_not_all_played():
+    a = Cassette('test')
+    a.append('foo', 'bar')
+    assert not a.all_played
+
+
+@mock.patch('vcr.cassette.requests_match', _mock_requests_match)
+def test_cassette_all_played():
+    a = Cassette('test')
+    a.append('foo', 'bar')
+    a.play_response('foo')
+    assert a.all_played

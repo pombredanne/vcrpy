@@ -1,96 +1,183 @@
 '''Stubs for patching HTTP and HTTPS requests'''
 
-from httplib import HTTPConnection, HTTPSConnection, HTTPMessage
-from cStringIO import StringIO
-
+try:
+    import http.client
+except ImportError:
+    pass
+import logging
+import six
+from six.moves.http_client import (
+    HTTPConnection,
+    HTTPSConnection,
+    HTTPMessage,
+    HTTPResponse,
+)
+from six import BytesIO
 from vcr.request import Request
 from vcr.errors import CannotOverwriteExistingCassetteException
+from . import compat
+
+log = logging.getLogger(__name__)
 
 
-def parse_headers_backwards_compat(header_dict):
+class VCRFakeSocket(object):
     """
-    In vcr 0.6.0, I changed the cassettes to store
-    headers as a list instead of a dict.  This method
-    parses the old dictionary-style headers for
-    backwards-compatability reasons.
+    A socket that doesn't do anything!
+    Used when playing back casssettes, when there
+    is no actual open socket.
     """
-    msg = HTTPMessage(StringIO(""))
-    for key, val in header_dict.iteritems():
-        msg.addheader(key, val)
-        msg.headers.append("{0}:{1}".format(key, val))
-    return msg
+
+    def close(self):
+        pass
+
+    def settimeout(self, *args, **kwargs):
+        pass
+
+    def fileno(self):
+        """
+        This is kinda crappy.  requests will watch
+        this descriptor and make sure it's not closed.
+        Return file descriptor 0 since that's stdin.
+        """
+        return 0  # wonder how bad this is....
 
 
 def parse_headers(header_list):
-    if isinstance(header_list, dict):
-        return parse_headers_backwards_compat(header_list)
-    headers = "".join(header_list) + "\r\n"
-    msg = HTTPMessage(StringIO(headers))
-    msg.fp.seek(0)
-    msg.readheaders()
-    return msg
+    """
+    Convert headers from our serialized dict with lists for keys to a
+    HTTPMessage
+    """
+    header_string = b""
+    for key, values in header_list.items():
+        for v in values:
+            header_string += \
+                key.encode('utf-8') + b":" + v.encode('utf-8') + b"\r\n"
+    return compat.get_httpmessage(header_string)
 
 
-class VCRHTTPResponse(object):
+def serialize_headers(response):
+    out = {}
+    for key, values in compat.get_headers(response):
+        out.setdefault(key, [])
+        out[key].extend(values)
+    return out
+
+
+class VCRHTTPResponse(HTTPResponse):
     """
     Stub reponse class that gets returned instead of a HTTPResponse
     """
     def __init__(self, recorded_response):
         self.recorded_response = recorded_response
         self.reason = recorded_response['status']['message']
-        self.status = recorded_response['status']['code']
+        self.status = self.code = recorded_response['status']['code']
         self.version = None
-        self._content = StringIO(self.recorded_response['body']['string'])
-        self.closed = False
+        self._content = BytesIO(self.recorded_response['body']['string'])
+        self._closed = False
 
         headers = self.recorded_response['headers']
         self.msg = parse_headers(headers)
 
-        self.length = self.msg.getheader('content-length') or None
+        self.length = compat.get_header(self.msg, 'content-length') or None
+
+    @property
+    def closed(self):
+        # in python3, I can't change the value of self.closed.  So I'
+        # twiddling self._closed and using this property to shadow the real
+        # self.closed from the superclas
+        return self._closed
 
     def read(self, *args, **kwargs):
-        # Note: I'm pretty much ignoring any chunking stuff because
-        # I don't really understand what it is or how it works.
         return self._content.read(*args, **kwargs)
 
+    def readline(self, *args, **kwargs):
+        return self._content.readline(*args, **kwargs)
+
     def close(self):
-        self.closed = True
+        self._closed = True
         return True
 
+    def getcode(self):
+        return self.status
+
     def isclosed(self):
-        # Urllib3 seems to call this because it actually uses
-        # the weird chunking support in httplib
         return self.closed
 
+    def info(self):
+        return parse_headers(self.recorded_response['headers'])
+
     def getheaders(self):
-        headers = parse_headers(self.recorded_response['headers'])
-        return headers.dict.iteritems()
+        message = parse_headers(self.recorded_response['headers'])
+        return compat.get_header_items(message)
+
+    def getheader(self, header, default=None):
+        headers = dict(((k, v) for k, v in self.getheaders()))
+        return headers.get(header, default)
 
 
-class VCRConnectionMixin:
+class VCRConnection:
     # A reference to the cassette that's currently being patched in
     cassette = None
 
+    def _port_postfix(self):
+        """
+        Returns empty string for the default port and ':port' otherwise
+        """
+        port = self.real_connection.port
+        default_port = {'https': 433, 'http': 80}[self._protocol]
+        return ':{0}'.format(port) if port != default_port else ''
+
+    def _uri(self, url):
+        """Returns request absolute URI"""
+        uri = "{0}://{1}{2}{3}".format(
+            self._protocol,
+            self.real_connection.host,
+            self._port_postfix(),
+            url,
+        )
+        return uri
+
+    def _url(self, uri):
+        """Returns request selector url from absolute URI"""
+        prefix = "{0}://{1}{2}".format(
+            self._protocol,
+            self.real_connection.host,
+            self._port_postfix(),
+        )
+        return uri.replace(prefix, '', 1)
+
     def request(self, method, url, body=None, headers=None):
         '''Persist the request metadata in self._vcr_request'''
-        # see VCRConnectionMixin._restore_socket for the motivation here
-        if hasattr(self, 'sock'):
-            del self.sock
-
         self._vcr_request = Request(
-            protocol=self._protocol,
-            host=self.host,
-            port=self.port,
             method=method,
-            path=url,
+            uri=self._uri(url),
             body=body,
             headers=headers or {}
         )
+        log.debug('Got {0}'.format(self._vcr_request))
 
         # Note: The request may not actually be finished at this point, so
         # I'm not sending the actual request until getresponse().  This
         # allows me to compare the entire length of the response to see if it
         # exists in the cassette.
+
+    def putrequest(self, method, url, *args, **kwargs):
+        """
+        httplib gives you more than one way to do it.  This is a way
+        to start building up a request.  Usually followed by a bunch
+        of putheader() calls.
+        """
+        self._vcr_request = Request(
+            method=method,
+            uri=self._uri(url),
+            body="",
+            headers={}
+        )
+        log.debug('Got {0}'.format(self._vcr_request))
+
+    def putheader(self, header, *values):
+        for value in values:
+            self._vcr_request.add_header(header, value)
 
     def send(self, data):
         '''
@@ -101,94 +188,32 @@ class VCRConnectionMixin:
         self._vcr_request.body = (self._vcr_request.body or '') + data
 
     def close(self):
-        self._restore_socket()
-        self._baseclass.close(self)
+        # Note: the real connection will only close if it's open, so
+        # no need to check that here.
+        self.real_connection.close()
 
-    def _restore_socket(self):
+    def endheaders(self, *args, **kwargs):
         """
-        Since some libraries (REQUESTS!!) decide to set options on
-        connection.socket, I need to delete the socket attribute
-        (which makes requests think this is a AppEngine connection)
-        and then restore it when I want to make the actual request.
-        This function restores it to its standard initial value
-        (which is None)
+        Normally, this would atually send the request to the server.
+        We are not sending the request until getting the response,
+        so bypass this method for now.
         """
-        if not hasattr(self, 'sock'):
-            self.sock = None
-
-    def _send_request(self, method, url, body, headers):
-        """
-        Copy+pasted from python stdlib 2.6 source because it
-        has a call to self.send() which I have overridden
-        #stdlibproblems #fml
-        """
-        header_names = dict.fromkeys([k.lower() for k in headers])
-        skips = {}
-        if 'host' in header_names:
-            skips['skip_host'] = 1
-        if 'accept-encoding' in header_names:
-            skips['skip_accept_encoding'] = 1
-
-        self.putrequest(method, url, **skips)
-
-        if body and ('content-length' not in header_names):
-            thelen = None
-            try:
-                thelen = str(len(body))
-            except TypeError, te:
-                # If this is a file-like object, try to
-                # fstat its file descriptor
-                import os
-                try:
-                    thelen = str(os.fstat(body.fileno()).st_size)
-                except (AttributeError, OSError):
-                    # Don't send a length if this failed
-                    if self.debuglevel > 0:
-                        print "Cannot stat!!"
-
-            if thelen is not None:
-                self.putheader('Content-Length', thelen)
-        for hdr, value in headers.iteritems():
-            self.putheader(hdr, value)
-        self.endheaders()
-
-        if body:
-            self._baseclass.send(self, body)
-
-    def _send_output(self, message_body=None):
-        """
-        Copy-and-pasted from httplib, just so I can modify the self.send()
-        calls to call the superclass's send(), since I had to override the
-        send() behavior, since send() is both an external and internal
-        httplib API.
-        """
-        self._buffer.extend(("", ""))
-        msg = "\r\n".join(self._buffer)
-        del self._buffer[:]
-        # If msg and message_body are sent in a single send() call,
-        # it will avoid performance problems caused by the interaction
-        # between delayed ack and the Nagle algorithm.
-        if isinstance(message_body, str):
-            msg += message_body
-            message_body = None
-        self._restore_socket()
-        self._baseclass.send(self, msg)
-        if message_body is not None:
-            #message_body was not a string (i.e. it is a file) and
-            #we must run the risk of Nagle
-            self._baseclass.send(self, message_body)
+        pass
 
     def getresponse(self, _=False):
         '''Retrieve a the response'''
         # Check to see if the cassette has a response for this request. If so,
         # then return it
-        if self._vcr_request in self.cassette and \
-                self.cassette.record_mode != "all" and \
-                self.cassette.rewound:
+        if self.cassette.can_play_response_for(self._vcr_request):
+            log.info(
+                "Playing response for {0} from cassette".format(
+                    self._vcr_request
+                )
+            )
             response = self.cassette.play_response(self._vcr_request)
             return VCRHTTPResponse(response)
         else:
-            if self.cassette.write_protected:
+            if self.cassette.write_protected and self.cassette._filter_request(self._vcr_request):
                 raise CannotOverwriteExistingCassetteException(
                     "Can't overwrite existing cassette (%r) in "
                     "your current record mode (%r)."
@@ -198,20 +223,20 @@ class VCRConnectionMixin:
             # Otherwise, we should send the request, then get the response
             # and return it.
 
-           # restore sock's value to None, since we need a real socket
-            self._restore_socket()
-
-            #make the actual request
-            self._baseclass.request(
-                self,
+            log.info(
+                "{0} not in cassette, sending to real server".format(
+                    self._vcr_request
+                )
+            )
+            self.real_connection.request(
                 method=self._vcr_request.method,
-                url=self._vcr_request.path,
+                url=self._url(self._vcr_request.uri),
                 body=self._vcr_request.body,
-                headers=dict(self._vcr_request.headers or {})
+                headers=self._vcr_request.headers,
             )
 
             # get the response
-            response = self._baseclass.getresponse(self)
+            response = self.real_connection.getresponse()
 
             # put the response into the cassette
             response = {
@@ -219,29 +244,66 @@ class VCRConnectionMixin:
                     'code': response.status,
                     'message': response.reason
                 },
-                'headers': response.msg.headers,
+                'headers': serialize_headers(response),
                 'body': {'string': response.read()},
             }
             self.cassette.append(self._vcr_request, response)
         return VCRHTTPResponse(response)
 
+    def set_debuglevel(self, *args, **kwargs):
+        self.real_connection.set_debuglevel(*args, **kwargs)
 
-class VCRHTTPConnection(VCRConnectionMixin, HTTPConnection):
+    def connect(self, *args, **kwargs):
+        """
+        httplib2 uses this.  Connects to the server I'm assuming.
+
+        Only pass to the baseclass if we don't have a recorded response
+        and are not write-protected.
+        """
+
+        if hasattr(self, '_vcr_request') and \
+                self.cassette.can_play_response_for(self._vcr_request):
+            # We already have a response we are going to play, don't
+            # actually connect
+            return
+
+        if self.cassette.write_protected:
+            # Cassette is write-protected, don't actually connect
+            return
+
+        return self.real_connection.connect(*args, **kwargs)
+
+    @property
+    def sock(self):
+        if self.real_connection.sock:
+            return self.real_connection.sock
+        return VCRFakeSocket()
+
+    @sock.setter
+    def sock(self, value):
+        if self.real_connection.sock:
+            self.real_connection.sock = value
+
+    def __init__(self, *args, **kwargs):
+        if six.PY3:
+            kwargs.pop('strict', None) # apparently this is gone in py3
+
+        # need to temporarily reset here because the real connection
+        # inherits from the thing that we are mocking out.  Take out
+        # the reset if you want to see what I mean :)
+        from vcr.patch import install, reset
+        reset()
+        self.real_connection = self._baseclass(*args, **kwargs)
+        install(self.cassette)
+
+
+class VCRHTTPConnection(VCRConnection):
     '''A Mocked class for HTTP requests'''
-    # Can't use super since this is an old-style class
     _baseclass = HTTPConnection
     _protocol = 'http'
 
 
-class VCRHTTPSConnection(VCRConnectionMixin, HTTPSConnection):
+class VCRHTTPSConnection(VCRConnection):
     '''A Mocked class for HTTPS requests'''
     _baseclass = HTTPSConnection
     _protocol = 'https'
-
-    def __init__(self, *args, **kwargs):
-        '''I overrode the init and copied a lot of the code from the parent
-        class because HTTPConnection when this happens has been replaced by
-        VCRHTTPConnection,  but doing it here lets us use the original one.'''
-        HTTPConnection.__init__(self, *args, **kwargs)
-        self.key_file = kwargs.pop('key_file', None)
-        self.cert_file = kwargs.pop('cert_file', None)

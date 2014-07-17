@@ -1,7 +1,7 @@
 '''Utilities for patching in cassettes'''
 
-import httplib
 from .stubs import VCRHTTPConnection, VCRHTTPSConnection
+from six.moves import http_client as httplib
 
 
 # Save some of the original types for the purposes of unpatching
@@ -12,8 +12,8 @@ try:
     # Try to save the original types for requests
     import requests.packages.urllib3.connectionpool as cpool
     _VerifiedHTTPSConnection = cpool.VerifiedHTTPSConnection
-    _HTTPConnection = cpool.HTTPConnection
-    _HTTPSConnection = cpool.HTTPSConnection
+    _cpoolHTTPConnection = cpool.HTTPConnection
+    _cpoolHTTPSConnection = cpool.HTTPSConnection
 except ImportError:  # pragma: no cover
     pass
 
@@ -24,6 +24,23 @@ try:
 except ImportError:  # pragma: no cover
     pass
 
+try:
+    # Try to save the original types for httplib2
+    import httplib2
+    _HTTPConnectionWithTimeout = httplib2.HTTPConnectionWithTimeout
+    _HTTPSConnectionWithTimeout = httplib2.HTTPSConnectionWithTimeout
+    _SCHEME_TO_CONNECTION = httplib2.SCHEME_TO_CONNECTION
+except ImportError:  # pragma: no cover
+    pass
+
+try:
+    # Try to save the original types for boto
+    import boto.https_connection
+    _CertValidatingHTTPSConnection = \
+        boto.https_connection.CertValidatingHTTPSConnection
+except ImportError:  # pragma: no cover
+    pass
+
 
 def install(cassette):
     """
@@ -31,9 +48,8 @@ def install(cassette):
     This replaces the actual HTTPConnection with a VCRHTTPConnection
     object which knows how to save to / read from cassettes
     """
-    httplib.HTTPConnection = httplib.HTTP._connection_class = VCRHTTPConnection
-    httplib.HTTPSConnection = httplib.HTTPS._connection_class = (
-        VCRHTTPSConnection)
+    httplib.HTTPConnection = VCRHTTPConnection
+    httplib.HTTPSConnection = VCRHTTPSConnection
     httplib.HTTPConnection.cassette = cassette
     httplib.HTTPSConnection.cassette = cassette
 
@@ -64,18 +80,43 @@ def install(cassette):
     except ImportError:  # pragma: no cover
         pass
 
+    # patch httplib2
+    try:
+        import httplib2 as cpool
+        from .stubs.httplib2_stubs import VCRHTTPConnectionWithTimeout
+        from .stubs.httplib2_stubs import VCRHTTPSConnectionWithTimeout
+        cpool.HTTPConnectionWithTimeout = VCRHTTPConnectionWithTimeout
+        cpool.HTTPSConnectionWithTimeout = VCRHTTPSConnectionWithTimeout
+        cpool.SCHEME_TO_CONNECTION = {
+            'http': VCRHTTPConnectionWithTimeout,
+            'https': VCRHTTPSConnectionWithTimeout
+        }
+    except ImportError:  # pragma: no cover
+        pass
+
+    # patch boto
+    try:
+        import boto.https_connection as cpool
+        from .stubs.boto_stubs import VCRCertValidatingHTTPSConnection
+        cpool.CertValidatingHTTPSConnection = VCRCertValidatingHTTPSConnection
+        cpool.CertValidatingHTTPSConnection.cassette = cassette
+    except ImportError:  # pragma: no cover
+        pass
+
 
 def reset():
     '''Undo all the patching'''
-    httplib.HTTPConnection = httplib.HTTP._connection_class = _HTTPConnection
-    httplib.HTTPSConnection = httplib.HTTPS._connection_class = \
-        _HTTPSConnection
+    httplib.HTTPConnection = _HTTPConnection
+    httplib.HTTPSConnection = _HTTPSConnection
     try:
         import requests.packages.urllib3.connectionpool as cpool
+        # unpatch requests v1.x
         cpool.VerifiedHTTPSConnection = _VerifiedHTTPSConnection
-        cpool.HTTPConnection = _HTTPConnection
-        cpool.HTTPConnectionPool.ConnectionCls = _HTTPConnection
-        cpool.HTTPSConnectionPool.ConnectionCls = _HTTPSConnection
+        cpool.HTTPConnection = _cpoolHTTPConnection
+        # unpatch requests v2.x
+        cpool.HTTPConnectionPool.ConnectionCls = _cpoolHTTPConnection
+        cpool.HTTPSConnection = _cpoolHTTPSConnection
+        cpool.HTTPSConnectionPool.ConnectionCls = _cpoolHTTPSConnection
     except ImportError:  # pragma: no cover
         pass
 
@@ -83,7 +124,22 @@ def reset():
         import urllib3.connectionpool as cpool
         cpool.VerifiedHTTPSConnection = _VerifiedHTTPSConnection
         cpool.HTTPConnection = _HTTPConnection
+        cpool.HTTPSConnection = _HTTPSConnection
         cpool.HTTPConnectionPool.ConnectionCls = _HTTPConnection
         cpool.HTTPSConnectionPool.ConnectionCls = _HTTPSConnection
+    except ImportError:  # pragma: no cover
+        pass
+
+    try:
+        import httplib2 as cpool
+        cpool.HTTPConnectionWithTimeout = _HTTPConnectionWithTimeout
+        cpool.HTTPSConnectionWithTimeout = _HTTPSConnectionWithTimeout
+        cpool.SCHEME_TO_CONNECTION = _SCHEME_TO_CONNECTION
+    except ImportError:  # pragma: no cover
+        pass
+
+    try:
+        import boto.https_connection as cpool
+        cpool.CertValidatingHTTPSConnection = _CertValidatingHTTPSConnection
     except ImportError:  # pragma: no cover
         pass
